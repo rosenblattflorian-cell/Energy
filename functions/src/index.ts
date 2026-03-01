@@ -3,6 +3,7 @@ import * as logger from "firebase-functions/logger";
 import { initializeApp } from "firebase-admin/app";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
+import { getAuth } from "firebase-admin/auth";
 import QRCode from "qrcode";
 import { canSubmit, createSignatureToken, hashToken } from "./signature";
 import { embedSignatureInPdf, parseDataUrlPngBytes } from "./pdf";
@@ -28,6 +29,32 @@ export const createSignatureRequest = onRequest(async (req, res) => {
   const { projectId, docId } = req.body ?? {};
   if (!projectId || !docId) {
     res.status(400).json({ error: "projectId and docId are required" });
+    return;
+  }
+
+  const authHeader = req.headers.authorization;
+  const match = typeof authHeader === "string" ? authHeader.match(/^Bearer\s+(.+)$/i) : null;
+  if (!match) {
+    res.status(401).json({ error: "missing bearer token" });
+    return;
+  }
+
+  try {
+    await getAuth().verifyIdToken(match[1]);
+  } catch {
+    res.status(401).json({ error: "invalid bearer token" });
+    return;
+  }
+
+  const documentSnap = await getFirestore().collection("documents").doc(String(docId)).get();
+  if (!documentSnap.exists) {
+    res.status(404).json({ error: "document not found" });
+    return;
+  }
+
+  const documentProjectId = String(documentSnap.data()?.projectId ?? "");
+  if (documentProjectId && documentProjectId !== String(projectId)) {
+    res.status(403).json({ error: "project/document mismatch" });
     return;
   }
 
@@ -94,15 +121,55 @@ export const submitSignature = onRequest(async (req, res) => {
     return;
   }
 
-  const documentData = documentSnap.data() ?? {};
-  const currentVersion = Number(documentData.version ?? 1);
-  const currentStoragePath =
-    typeof documentData.currentStoragePath === "string"
-      ? documentData.currentStoragePath
-      : `projects/${projectId}/documents/${docId}/versions/${currentVersion}.pdf`;
+  const reservation = await db.runTransaction(async (tx) => {
+    const reqSnap = await tx.get(signatureRequestRef);
+    const reqData = reqSnap.data();
+    if (!reqData) {
+      throw new Error("signature request missing");
+    }
+
+    const stillExpiresAt = parseTimestampMs(reqData.expiresAt);
+    if (!canSubmit(reqData.status, stillExpiresAt)) {
+      throw new Error("token no longer valid");
+    }
+
+    const txDocumentSnap = await tx.get(documentRef);
+    if (!txDocumentSnap.exists) {
+      throw new Error("document not found");
+    }
+
+    const documentData = txDocumentSnap.data() ?? {};
+    const currentVersion = Number(documentData.version ?? 1);
+    const nextVersion = Number(documentData.nextVersion ?? currentVersion + 1);
+    const reservedVersion = Math.max(currentVersion + 1, nextVersion);
+    const sourceStoragePath =
+      typeof documentData.currentStoragePath === "string"
+        ? documentData.currentStoragePath
+        : `projects/${projectId}/documents/${docId}/versions/${currentVersion}.pdf`;
+    const reservedStoragePath = `projects/${projectId}/documents/${docId}/versions/${reservedVersion}.pdf`;
+
+    tx.update(documentRef, {
+      nextVersion: reservedVersion + 1,
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    tx.update(signatureRequestRef, {
+      status: "processing",
+      reservedVersion,
+      reservedStoragePath,
+      sourceStoragePath,
+      processingStartedAt: FieldValue.serverTimestamp(),
+    });
+
+    return {
+      sourceStoragePath,
+      reservedStoragePath,
+      reservedVersion,
+    };
+  });
 
   const bucket = getStorage().bucket();
-  const [originalPdf] = await bucket.file(currentStoragePath).download();
+  const [originalPdf] = await bucket.file(reservation.sourceStoragePath).download();
   const pngBytes = parseDataUrlPngBytes(String(signatureDataUrl));
 
   const signedPdf = await embedSignatureInPdf({
@@ -114,11 +181,10 @@ export const submitSignature = onRequest(async (req, res) => {
     height: 70,
   });
 
-  const newVersion = currentVersion + 1;
-  const newStoragePath = `projects/${projectId}/documents/${docId}/versions/${newVersion}.pdf`;
-  await bucket.file(newStoragePath).save(Buffer.from(signedPdf), {
+  await bucket.file(reservation.reservedStoragePath).save(Buffer.from(signedPdf), {
     contentType: "application/pdf",
     resumable: false,
+    preconditionOpts: { ifGenerationMatch: 0 },
   });
 
   await db.runTransaction(async (tx) => {
@@ -128,9 +194,23 @@ export const submitSignature = onRequest(async (req, res) => {
       throw new Error("signature request missing");
     }
 
-    const stillExpiresAt = parseTimestampMs(reqData.expiresAt);
-    if (!canSubmit(reqData.status, stillExpiresAt)) {
-      throw new Error("token no longer valid");
+    if (reqData.status !== "processing") {
+      throw new Error("signature request is not reserved for processing");
+    }
+
+    if (
+      Number(reqData.reservedVersion) !== reservation.reservedVersion ||
+      String(reqData.reservedStoragePath ?? "") !== reservation.reservedStoragePath
+    ) {
+      throw new Error("signature request reservation mismatch");
+    }
+
+    const txDocumentSnap = await tx.get(documentRef);
+    const txDocumentData = txDocumentSnap.data() ?? {};
+    const txCurrentVersion = Number(txDocumentData.version ?? 1);
+
+    if (txCurrentVersion >= reservation.reservedVersion) {
+      throw new Error("document has advanced past reserved version");
     }
 
     tx.update(signatureRequestRef, {
@@ -143,16 +223,16 @@ export const submitSignature = onRequest(async (req, res) => {
         x: 50,
         y: 50,
       },
-      signedStoragePath: newStoragePath,
+      signedStoragePath: reservation.reservedStoragePath,
     });
 
     tx.set(
       documentRef,
       {
-        version: newVersion,
+        version: reservation.reservedVersion,
         status: "signed",
         updatedAt: FieldValue.serverTimestamp(),
-        currentStoragePath: newStoragePath,
+        currentStoragePath: reservation.reservedStoragePath,
       },
       { merge: true },
     );
@@ -160,20 +240,20 @@ export const submitSignature = onRequest(async (req, res) => {
     tx.set(db.collection("documentVersions").doc(), {
       docId,
       projectId,
-      version: newVersion,
-      storagePath: newStoragePath,
-      sourceStoragePath: currentStoragePath,
+      version: reservation.reservedVersion,
+      storagePath: reservation.reservedStoragePath,
+      sourceStoragePath: reservation.sourceStoragePath,
       createdAt: FieldValue.serverTimestamp(),
       createdBy: "submitSignature",
       kind: "signed",
     });
   });
 
-  const [pdfUrl] = await bucket.file(newStoragePath).getSignedUrl({
+  const [pdfUrl] = await bucket.file(reservation.reservedStoragePath).getSignedUrl({
     action: "read",
     expires: Date.now() + 60 * 60 * 1000,
   });
 
-  logger.info("Signature submitted", { docId, projectId, version: newVersion });
-  res.json({ success: true, pdfUrl, version: newVersion });
+  logger.info("Signature submitted", { docId, projectId, version: reservation.reservedVersion });
+  res.json({ success: true, pdfUrl, version: reservation.reservedVersion });
 });
