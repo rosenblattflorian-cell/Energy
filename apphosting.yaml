@@ -1,0 +1,10 @@
+runConfig:
+  minInstances: 0
+  maxInstances: 2
+  cpu: 1
+  memoryMiB: 512
+env:
+  - variable: FUNCTIONS_BASE_URL
+    secret: FUNCTIONS_BASE_URL
+  - variable: BASE_URL
+    secret: BASE_URL
