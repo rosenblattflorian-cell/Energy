@@ -23,6 +23,10 @@ Deploy functions first:
 firebase deploy --only functions
 ```
 
+Expected function exports from `functions/src/index.ts`:
+- `createSignatureRequest`
+- `submitSignature`
+
 ## 4) Firestore rules + indexes
 
 ```bash
@@ -33,4 +37,5 @@ firebase deploy --only firestore
 
 Connect this repo to App Hosting in Firebase console, ensure `apphosting.yaml` is detected, then deploy.
 
-> `firebase.json` intentionally has no static hosting `public: out` config, because this app uses SSR.
+> `firebase.json` intentionally has no static hosting `public: out` config and no hosting rewrites.
+> SSR/dynamic routing is handled by App Hosting.

@@ -10,7 +10,13 @@ describe("pdf signing helper", () => {
     const png = dataUrlToBytes(
       "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4//8/AwAI/AL+XxjVfQAAAABJRU5ErkJggg=="
     );
-    const signed = await embedSignatureInPdf(base, png);
+    const signed = await embedSignatureInPdf(base, png, "customerSignature");
     expect(signed.length).toBeGreaterThan(base.length);
+  });
+
+  it("rejects non-png data url", () => {
+    expect(() => dataUrlToBytes("data:text/plain;base64,aGVsbG8=")).toThrowError(
+      "signatureDataUrl must be a PNG data URL"
+    );
   });
 });
